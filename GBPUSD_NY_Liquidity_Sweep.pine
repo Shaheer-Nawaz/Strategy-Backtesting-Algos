@@ -1,0 +1,127 @@
+//@version=6
+strategy("GBPUSD NY Liquidity Sweep + Price Action", overlay=true,
+     initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     commission_type=strategy.commission.cash_per_contract, commission_value=0,
+     slippage=2, pyramiding=0, calc_on_every_tick=false)
+
+// ================= INPUTS =================
+tz        = "America/New_York"
+lonSess   = input.session("0200-0700", "London liquidity window (NY time)", group="Sessions")
+nySess    = input.session("0800-1100", "NY entry window (NY time)",         group="Sessions")
+
+useLon    = input.bool(true, "Use London High/Low", group="Liquidity")
+usePD     = input.bool(true, "Use Previous Day High/Low", group="Liquidity")
+
+maxBars   = input.int(6, "Max bars to confirm after sweep", minval=1, group="Price Action")
+bufPips   = input.float(2.0, "SL buffer (pips)", step=0.5, group="Risk")
+rr        = input.float(2.0, "Risk:Reward", step=0.25, group="Risk")
+minRisk   = input.float(5.0, "Min risk (pips)", group="Risk")
+maxRisk   = input.float(30.0, "Max risk (pips)", group="Risk")
+maxTrades = input.int(1, "Max trades per day", minval=1, group="Risk")
+allowLong  = input.bool(true, "Allow Longs", group="Direction")
+allowShort = input.bool(true, "Allow Shorts", group="Direction")
+
+pip = syminfo.mintick * 10
+
+// ================= SESSION / DAY LOGIC =================
+inLon = not na(time(timeframe.period, lonSess, tz))
+inNY  = not na(time(timeframe.period, nySess, tz))
+
+dayKey = year(time, tz) * 10000 + month(time, tz) * 100 + dayofmonth(time, tz)
+newDay = dayKey != dayKey[1]
+
+// Previous day high/low (non-repainting)
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+
+var float lonH = na
+var float lonL = na
+var int   trades = 0
+
+// Setup state
+var bool  shortSetup = false
+var bool  longSetup  = false
+var float sweepHigh  = na   // extreme of sweep wick (for short SL)
+var float sweepLow   = na   // extreme of sweep wick (for long SL)
+var float trigShort  = na   // low of sweep candle (break = confirm short)
+var float trigLong   = na   // high of sweep candle (break = confirm long)
+var int   setupBar   = na
+
+if newDay
+    lonH := na
+    lonL := na
+    trades := 0
+    shortSetup := false
+    longSetup := false
+
+if inLon
+    lonH := na(lonH) ? high : math.max(lonH, high)
+    lonL := na(lonL) ? low  : math.min(lonL, low)
+
+// ================= SWEEP DETECTION =================
+sweptHigh = inNY and ((useLon and not na(lonH) and high > lonH and close < lonH) or
+                      (usePD  and high > pdh   and close < pdh))
+sweptLow  = inNY and ((useLon and not na(lonL) and low  < lonL and close > lonL) or
+                      (usePD  and low  < pdl   and close > pdl))
+
+if sweptHigh and allowShort and trades < maxTrades
+    shortSetup := true
+    longSetup  := false
+    sweepHigh  := high
+    trigShort  := low
+    setupBar   := bar_index
+
+if sweptLow and allowLong and trades < maxTrades
+    longSetup  := true
+    shortSetup := false
+    sweepLow   := low
+    trigLong   := high
+    setupBar   := bar_index
+
+// Expire setups
+if not inNY or (not na(setupBar) and bar_index - setupBar > maxBars)
+    shortSetup := false
+    longSetup  := false
+
+// ================= CONFIRMATION & ENTRY =================
+isNewBar = bar_index > setupBar
+shortConfirm = shortSetup and isNewBar and close < trigShort and close < open
+longConfirm  = longSetup  and isNewBar and close > trigLong  and close > open
+
+var float slPrice = na
+var float tpPrice = na
+
+if shortConfirm and strategy.position_size == 0
+    sl = sweepHigh + bufPips * pip
+    riskPips = (sl - close) / pip
+    if riskPips >= minRisk and riskPips <= maxRisk
+        slPrice := sl
+        tpPrice := close - (sl - close) * rr
+        strategy.entry("Short", strategy.short)
+        strategy.exit("Short Exit", "Short", stop=slPrice, limit=tpPrice)
+        trades += 1
+    shortSetup := false
+
+if longConfirm and strategy.position_size == 0
+    sl = sweepLow - bufPips * pip
+    riskPips = (close - sl) / pip
+    if riskPips >= minRisk and riskPips <= maxRisk
+        slPrice := sl
+        tpPrice := close + (close - sl) * rr
+        strategy.entry("Long", strategy.long)
+        strategy.exit("Long Exit", "Long", stop=slPrice, limit=tpPrice)
+        trades += 1
+    longSetup := false
+
+// Flat at end of NY window
+if not inNY and strategy.position_size != 0
+    strategy.close_all(comment="Session End")
+
+// ================= PLOTS =================
+plot(lonH, "London High", color=color.new(color.orange, 20), style=plot.style_linebr)
+plot(lonL, "London Low",  color=color.new(color.orange, 20), style=plot.style_linebr)
+plot(pdh,  "PDH", color=color.new(color.blue, 30), style=plot.style_linebr)
+plot(pdl,  "PDL", color=color.new(color.blue, 30), style=plot.style_linebr)
+bgcolor(inNY ? color.new(color.gray, 90) : na)
+plotshape(sweptHigh, "Sweep High", shape.triangledown, location.abovebar, color.red, size=size.tiny)
+plotshape(sweptLow,  "Sweep Low",  shape.triangleup,   location.belowbar, color.green, size=size.tiny)
